@@ -7,9 +7,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip project if only the zip was uploaded
-        run: "if [ -f MoS-Reader-Android.zip ]; then unzip -o MoS-Reader-Android.zip; fi
-if [ -d MoS-Reader-Android ]; then echo \"DIR=MoS-Reader-Android\" >> $GITHUB_ENV; else echo \"DIR=.\" >> $GITHUB_ENV; fi
+      - name: Unzip the project (any zip name works)
+        run: "for z in *.zip; do [ -f \"$z\" ] && unzip -o \"$z\"; done
+if [ -d MoS-Reader-Android ]; then echo \"DIR=MoS-Reader-Android\" >> $GITHUB_ENV
+else D=$(dirname \"$(find . -name settings.gradle.kts -not -path './.git/*' | head -1)\" 2>/dev/null); echo \"DIR=${D:-.}\" >> $GITHUB_ENV; fi
+"
+      - name: Check the project is actually here
+        run: "if [ ! -f \"$DIR/settings.gradle.kts\" ]; then
+  echo \"::error::MoS-Reader-Android.zip is NOT in this repository.\"
+  echo \"::error::Upload the zip on the repo Code page, then re-run this workflow.\"
+  echo \"Files currently in the repo:\"; ls -la
+  exit 1
+fi
+echo \"Project found in: $DIR\"
 "
       - uses: actions/setup-java@v4
         with:
@@ -18,8 +28,10 @@ if [ -d MoS-Reader-Android ]; then echo \"DIR=MoS-Reader-Android\" >> $GITHUB_EN
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.7
+      - name: Accept Android SDK licenses
+        run: "yes | \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --licenses > /dev/null 2>&1 || true"
       - name: Build debug APK
-        run: "cd \"$DIR\" && gradle assembleDebug"
+        run: "cd \"$DIR\" && gradle assembleDebug --no-daemon"
       - uses: actions/upload-artifact@v4
         with:
           name: MoS-Reader-APK
