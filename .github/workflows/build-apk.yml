@@ -6,20 +6,315 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Unzip the project (any zip name works)
-        run: "for z in *.zip; do [ -f \"$z\" ] && unzip -o \"$z\"; done
-if [ -d MoS-Reader-Android ]; then echo \"DIR=MoS-Reader-Android\" >> $GITHUB_ENV
-else D=$(dirname \"$(find . -name settings.gradle.kts -not -path './.git/*' | head -1)\" 2>/dev/null); echo \"DIR=${D:-.}\" >> $GITHUB_ENV; fi
-"
-      - name: Check the project is actually here
-        run: "if [ ! -f \"$DIR/settings.gradle.kts\" ]; then
-  echo \"::error::MoS-Reader-Android.zip is NOT in this repository.\"
-  echo \"::error::Upload the zip on the repo Code page, then re-run this workflow.\"
-  echo \"Files currently in the repo:\"; ls -la
-  exit 1
-fi
-echo \"Project found in: $DIR\"
+      - name: Write the project
+        run: "set -e
+mkdir -p proj
+cat > 'proj/settings.gradle.kts' << 'MOSEOF'
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = \"MoS Reader\"
+include(\":app\")
+MOSEOF
+cat > 'proj/build.gradle.kts' << 'MOSEOF'
+plugins {
+    id(\"com.android.application\") version \"8.5.2\" apply false
+    id(\"org.jetbrains.kotlin.android\") version \"1.9.24\" apply false
+}
+MOSEOF
+cat > 'proj/gradle.properties' << 'MOSEOF'
+org.gradle.jvmargs=-Xmx2048m
+android.useAndroidX=true
+kotlin.code.style=official
+MOSEOF
+mkdir -p 'proj/app'
+cat > 'proj/app/build.gradle.kts' << 'MOSEOF'
+plugins {
+    id(\"com.android.application\")
+    id(\"org.jetbrains.kotlin.android\")
+}
+android {
+    namespace = \"com.darkkrey.mosreader\"
+    compileSdk = 35
+    defaultConfig {
+        applicationId = \"com.darkkrey.mosreader\"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = \"1.0\"
+    }
+    buildTypes {
+        release { isMinifyEnabled = false }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = \"17\" }
+}
+dependencies {
+    implementation(\"androidx.core:core-ktx:1.13.1\")
+    implementation(\"androidx.appcompat:appcompat:1.7.0\")
+    implementation(\"androidx.activity:activity-ktx:1.9.2\")
+    implementation(\"androidx.webkit:webkit:1.11.0\")
+}
+MOSEOF
+mkdir -p 'proj/app/src/main'
+cat > 'proj/app/src/main/AndroidManifest.xml' << 'MOSEOF'
+<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">
+    <application
+        android:allowBackup=\"true\"
+        android:label=\"MoS Reader\"
+        android:supportsRtl=\"true\"
+        android:theme=\"@style/Theme.MoSReader\">
+        <activity
+            android:name=\".MainActivity\"
+            android:exported=\"true\"
+            android:configChanges=\"orientation|screenSize|keyboardHidden|uiMode\"
+            android:launchMode=\"singleTask\">
+            <intent-filter>
+                <action android:name=\"android.intent.action.MAIN\" />
+                <category android:name=\"android.intent.category.LAUNCHER\" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name=\"android.intent.action.VIEW\" />
+                <category android:name=\"android.intent.category.DEFAULT\" />
+                <data android:scheme=\"content\" android:mimeType=\"text/html\" />
+                <data android:scheme=\"file\" android:mimeType=\"text/html\" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+MOSEOF
+mkdir -p 'proj/app/src/main/res/values'
+cat > 'proj/app/src/main/res/values/themes.xml' << 'MOSEOF'
+<resources>
+    <style name=\"Theme.MoSReader\" parent=\"Theme.AppCompat.NoActionBar\">
+        <item name=\"android:statusBarColor\">#12100e</item>
+        <item name=\"android:navigationBarColor\">#12100e</item>
+        <item name=\"android:windowBackground\">#12100e</item>
+    </style>
+</resources>
+MOSEOF
+mkdir -p 'proj/app/src/main/java/com/darkkrey/mosreader'
+cat > 'proj/app/src/main/java/com/darkkrey/mosreader/NativeTts.kt' << 'MOSEOF'
+package com.darkkrey.mosreader
+
+import android.content.Context
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Locale
+
+/**
+ * The bridge the reader page detects as window.NativeTTS.
+ *
+ * The whole reason this app exists: Android's own TextToSpeech reports the
+ * exact character range of every word as it is spoken (onRangeStart), the
+ * callback the mobile browser never delivers. The page feeds those events
+ * into the same clock it uses everywhere, and the highlight becomes
+ * event-exact while whole units are spoken in one piece, so the prosody is
+ * the engine's natural sentence reading with no artificial seams.
+ */
+class NativeTts(
+    private val context: Context,
+    private val webView: WebView,
+    private val onReady: () -> Unit,
+    private val keepScreenOn: (Boolean) -> Unit
+) {
+    @Volatile private var ready = false
+    private var tts: TextToSpeech? = null
+
+    init { create(\"com.google.android.tts\", allowFallback = true) }
+
+    /** Prefer Google's engine (reliable onRangeStart); fall back to default. */
+    private fun create(engine: String?, allowFallback: Boolean) {
+        tts = if (engine != null)
+            TextToSpeech(context, { status -> onInit(status, allowFallback) }, engine)
+        else
+            TextToSpeech(context) { status -> onInit(status, false) }
+    }
+
+    private fun onInit(status: Int, allowFallback: Boolean) {
+        if (status != TextToSpeech.SUCCESS) {
+            if (allowFallback) { tts?.shutdown(); create(null, false) }
+            return
+        }
+        tts?.language = Locale.US
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(id: String?) = js(\"s\", id)
+            override fun onRangeStart(id: String?, start: Int, end: Int, frame: Int) =
+                js(\"b\", id, start)
+            override fun onDone(id: String?) = js(\"d\", id)
+            @Deprecated(\"Deprecated in Java\")
+            override fun onError(id: String?) = js(\"e\", id)
+            override fun onError(id: String?, code: Int) = js(\"e\", id)
+        })
+        ready = true
+        webView.post { onReady() }
+    }
+
+    /** Callbacks arrive on a binder thread; evaluateJavascript needs main. */
+    private fun js(fn: String, id: String?, arg: Int? = null) {
+        val safe = (id ?: \"\").replace(\"\\\\\", \"\").replace(\"'\", \"\")
+        val call = \"window.NativeCB&&NativeCB.$fn('\" + safe + \"'\" +
+                (if (arg != null) \",$arg\" else \"\") + \")\"
+        webView.post { webView.evaluateJavascript(call, null) }
+    }
+
+    @JavascriptInterface fun isReady(): Boolean = ready
+
+    @JavascriptInterface fun speak(id: String, text: String) {
+        val t = tts ?: return
+        val max = TextToSpeech.getMaxSpeechInputLength()
+        val body = if (text.length > max) text.substring(0, max - 1) else text
+        t.speak(body, TextToSpeech.QUEUE_ADD, Bundle(), id)
+    }
+
+    @JavascriptInterface fun stop() { tts?.stop() }
+
+    @JavascriptInterface fun setRate(rate: Float) { tts?.setSpeechRate(rate) }
+
+    @JavascriptInterface fun setVoice(name: String) {
+        val t = tts ?: return
+        val v = t.voices?.firstOrNull { it.name == name } ?: return
+        t.voice = v
+    }
+
+    @JavascriptInterface fun getVoices(): String {
+        val t = tts ?: return \"[]\"
+        val def = t.defaultVoice?.name
+        val arr = JSONArray()
+        val vs = t.voices ?: return \"[]\"
+        vs.sortedBy { it.name }.forEach { v ->
+            arr.put(JSONObject()
+                .put(\"n\", v.name)
+                .put(\"l\", v.locale.toLanguageTag())
+                .put(\"def\", v.name == def))
+        }
+        return arr.toString()
+    }
+
+    @JavascriptInterface fun keepAwake(on: Boolean) {
+        webView.post { keepScreenOn(on) }
+    }
+
+    fun shutdown() { tts?.stop(); tts?.shutdown() }
+}
+MOSEOF
+mkdir -p 'proj/app/src/main/java/com/darkkrey/mosreader'
+cat > 'proj/app/src/main/java/com/darkkrey/mosreader/MainActivity.kt' << 'MOSEOF'
+package com.darkkrey.mosreader
+
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.view.WindowManager
+import android.webkit.WebSettings
+import android.webkit.WebView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+
+/**
+ * A full-screen WebView around the reader HTML, with NativeTts injected as
+ * window.NativeTTS before the page loads. Open the book from the launcher
+ * (a picker appears once and the choice is remembered) or from any file
+ * manager via \"Open with\". The same HTML file runs unchanged in a browser;
+ * inside this app it detects the bridge and switches to native speech.
+ */
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var web: WebView
+    private var bridge: NativeTts? = null
+    private val prefs by lazy { getSharedPreferences(\"mos\", MODE_PRIVATE) }
+
+    private val picker = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Exception) {}
+            prefs.edit().putString(\"book\", uri.toString()).apply()
+            loadBook(uri)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        web = WebView(this)
+        setContentView(web)
+
+        val s: WebSettings = web.settings
+        s.javaScriptEnabled = true
+        s.domStorageEnabled = true          // bookmarks, calibration, sync trim
+        s.allowFileAccess = true
+        s.mediaPlaybackRequiresUserGesture = false
+        s.textZoom = 100
+
+        bridge = NativeTts(
+            this, web,
+            onReady = {
+                // Engine voices may arrive after page load: refresh the menu.
+                web.evaluateJavascript(
+                    \"typeof loadVoices==='function'&&loadVoices()\", null)
+            },
+            keepScreenOn = { on ->
+                if (on) window.addFlags(
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                else window.clearFlags(
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            })
+        web.addJavascriptInterface(bridge!!, \"NativeTTS\")
+
+        val fromIntent = intent?.data
+        val saved = prefs.getString(\"book\", null)?.let { Uri.parse(it) }
+        when {
+            fromIntent != null -> {
+                prefs.edit().putString(\"book\", fromIntent.toString()).apply()
+                loadBook(fromIntent)
+            }
+            saved != null -> loadBook(saved)
+            else -> picker.launch(arrayOf(\"text/html\"))
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        intent.data?.let {
+            prefs.edit().putString(\"book\", it.toString()).apply()
+            loadBook(it)
+        }
+    }
+
+    private fun loadBook(uri: Uri) {
+        val html = try {
+            contentResolver.openInputStream(uri)?.bufferedReader()
+                ?.use { it.readText() }
+        } catch (_: Exception) { null }
+        if (html == null) { picker.launch(arrayOf(\"text/html\")); return }
+        // A stable https base gives localStorage one consistent origin.
+        web.loadDataWithBaseURL(
+            \"https://mos.local/\", html, \"text/html\", \"utf-8\", null)
+    }
+
+    override fun onDestroy() {
+        bridge?.shutdown()
+        super.onDestroy()
+    }
+}
+MOSEOF
+echo \"Project written:\"; find proj -type f | sort
 "
       - uses: actions/setup-java@v4
         with:
@@ -31,8 +326,8 @@ echo \"Project found in: $DIR\"
       - name: Accept Android SDK licenses
         run: "yes | \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --licenses > /dev/null 2>&1 || true"
       - name: Build debug APK
-        run: "cd \"$DIR\" && gradle assembleDebug --no-daemon"
+        run: cd proj && gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: MoS-Reader-APK
-          path: **/app/build/outputs/apk/debug/app-debug.apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
